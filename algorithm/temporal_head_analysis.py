@@ -146,20 +146,23 @@ def collect_frame_data(model, processor, adapter, frames, instruction):
         # ── Forward pass with attention output ──
         try:
             inputs = processor(prompt, image).to(model.device, dtype=torch.bfloat16)
+            extra = adapter.get_forward_kwargs(inputs)
             with torch.no_grad():
                 model(
                     input_ids=inputs["input_ids"],
                     pixel_values=inputs.get("pixel_values"),
                     attention_mask=inputs.get("attention_mask"),
                     output_attentions=True,
+                    **extra,
                 )
         except Exception as e:
             # Fallback for models with different processor API
             try:
                 inputs = processor(text=prompt, images=image, return_tensors="pt")
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                extra = adapter.get_forward_kwargs(inputs)
                 with torch.no_grad():
-                    model(**inputs, output_attentions=True)
+                    model(**inputs, output_attentions=True, **extra)
             except Exception as e2:
                 print(f"Error: {e2}")
                 for h in hooks:

@@ -34,6 +34,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+# transformers v5 renamed AutoModelForVision2Seq → AutoModelForImageTextToText
+try:
+    from transformers import AutoModelForVision2Seq as _VLAAutoModel
+except ImportError:
+    from transformers import AutoModelForImageTextToText as _VLAAutoModel
+
 # All datasets download into 3rd_party/datasets/ relative to repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 THIRD_PARTY_DIR = _REPO_ROOT / "3rd_party" / "datasets"
@@ -223,6 +229,14 @@ class VLAAdapter(ABC):
         """Run generation. Returns (token_ids, decoded_text)."""
         ...
 
+    def get_forward_kwargs(self, inputs: dict) -> dict:
+        """Extra kwargs to pass to model() during forward calls.
+
+        Override in subclasses that need special arguments (e.g. OFT needs
+        fake labels for action mask computation).
+        """
+        return {}
+
 
 # ─── OpenVLA Adapter ────────────────────────────────────────────────────────
 
@@ -240,9 +254,9 @@ class OpenVLAAdapter(VLAAdapter):
         )
 
     def load_model(self, device="auto"):
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+        from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(self.hf_id, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
+        model = _VLAAutoModel.from_pretrained(
             self.hf_id, torch_dtype=torch.bfloat16, device_map=device,
             trust_remote_code=True, attn_implementation="eager",
         )
@@ -286,10 +300,23 @@ class OpenVLAAdapter(VLAAdapter):
 # ─── CogACT Adapter ─────────────────────────────────────────────────────────
 
 class CogACTAdapter(VLAAdapter):
-    """Adapter for CogACT (CogACT/CogACT-Base) — Llama 2 7B backbone."""
+    """Adapter for CogACT (CogACT/CogACT-Base) — Llama 2 7B backbone.
+
+    CogACT wraps a PrismaticVLM (identical to OpenVLA's architecture) plus
+    a DiT diffusion action head.  It requires the ``prismatic`` package (from
+    the openvla repo) and the CogACT repo on sys.path.
+
+    Install prismatic::
+
+        git clone https://github.com/openvla/openvla.git 3rd_party/openvla
+        # Then this adapter adds it to sys.path automatically.
+
+    The CogACT submodule is already at 3rd_party/CogACT.
+    """
 
     def __init__(self, hf_id: str = "CogACT/CogACT-Base"):
         self.hf_id = hf_id
+        self._processor = None  # filled by load_model
 
     def get_config(self) -> ModelConfig:
         return ModelConfig(
@@ -298,18 +325,45 @@ class CogACTAdapter(VLAAdapter):
             num_vis_tokens=256, vis_grid=(16, 16),
         )
 
+    def _ensure_deps(self):
+        """Add openvla (for prismatic) and CogACT to sys.path."""
+        import sys
+        openvla_dir = _REPO_ROOT / "3rd_party" / "openvla"
+        cogact_dir = _REPO_ROOT / "3rd_party" / "CogACT"
+        for p in [str(openvla_dir), str(cogact_dir)]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
     def load_model(self, device="auto"):
-        from transformers import AutoModelForVision2Seq, AutoProcessor
-        processor = AutoProcessor.from_pretrained(self.hf_id, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
-            self.hf_id, torch_dtype=torch.bfloat16, device_map=device,
-            trust_remote_code=True, attn_implementation="eager",
+        self._ensure_deps()
+        try:
+            from vla import load_vla
+        except ImportError as e:
+            raise ImportError(
+                f"CogACT requires the prismatic package. Clone the OpenVLA repo:\n"
+                f"  git clone https://github.com/openvla/openvla.git "
+                f"{_REPO_ROOT / '3rd_party' / 'openvla'}\n"
+                f"Original error: {e}"
+            ) from e
+
+        dev = "cuda:0" if device == "auto" and torch.cuda.is_available() else device
+        model = load_vla(
+            self.hf_id,
+            load_for_training=False,
+            action_model_type="DiT-B",
+            future_action_window_size=15,
         )
-        model.eval()
-        return model, processor
+        model = model.to(dev).eval()
+
+        # Store image transform and tokenizer as a lightweight processor proxy
+        self._processor = _CogACTProcessor(
+            image_transform=model.vlm.vision_backbone.image_transform,
+            tokenizer=model.vlm.llm_backbone.tokenizer,
+        )
+        return model, self._processor
 
     def get_llm_layers(self, model) -> list:
-        return list(model.language_model.model.layers)
+        return list(model.vlm.llm_backbone.llm.model.layers)
 
     def get_attn_module(self, layer):
         return layer.self_attn
@@ -321,9 +375,9 @@ class CogACTAdapter(VLAAdapter):
         return f"In: What action should the robot take to {instruction}?\nOut:"
 
     def run_prefill(self, model, processor, image, prompt):
-        inputs = processor(prompt, image).to(model.device, dtype=torch.bfloat16)
+        inputs = processor(prompt, image).to(model.vlm.device, dtype=torch.bfloat16)
         with torch.no_grad():
-            model(
+            model.vlm(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs.get("pixel_values"),
                 attention_mask=inputs.get("attention_mask"),
@@ -332,22 +386,74 @@ class CogACTAdapter(VLAAdapter):
         return inputs
 
     def run_generate(self, model, processor, image, prompt, max_new_tokens=7):
-        inputs = processor(prompt, image).to(model.device, dtype=torch.bfloat16)
+        # CogACT uses diffusion for actions, but for token comparison we use
+        # the VLM's autoregressive generation.
+        inputs = processor(prompt, image).to(model.vlm.device, dtype=torch.bfloat16)
+        from transformers import GenerationConfig
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                        do_sample=False)
+            output_ids = model.vlm.llm_backbone.llm.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
         input_len = inputs["input_ids"].shape[1]
         generated = output_ids[:, input_len:]
         decoded = processor.tokenizer.decode(generated[0], skip_special_tokens=True)
         return generated[0].tolist(), decoded
 
 
+class _CogACTProcessor:
+    """Lightweight processor wrapper for CogACT (mimics OpenVLA processor API)."""
+
+    def __init__(self, image_transform, tokenizer):
+        self.image_transform = image_transform
+        self.tokenizer = tokenizer
+
+    def __call__(self, text, image):
+        input_ids = self.tokenizer(text, truncation=True, return_tensors="pt").input_ids
+        pixel_values = self.image_transform(image)
+        if isinstance(pixel_values, torch.Tensor):
+            pixel_values = pixel_values.unsqueeze(0)
+        elif isinstance(pixel_values, dict):
+            pixel_values = {k: v.unsqueeze(0) for k, v in pixel_values.items()}
+        return _BatchEncoding({
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "attention_mask": torch.ones_like(input_ids),
+        })
+
+
+class _BatchEncoding(dict):
+    """Minimal dict that supports .to(device, dtype)."""
+    def to(self, device, dtype=None):
+        out = {}
+        for k, v in self.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v.to(device, dtype=dtype) if dtype and v.is_floating_point() else v.to(device)
+            elif isinstance(v, dict):
+                out[k] = {kk: vv.to(device, dtype=dtype) if dtype and vv.is_floating_point() else vv.to(device)
+                          for kk, vv in v.items()}
+            else:
+                out[k] = v
+        return _BatchEncoding(out)
+
+    def get(self, key, default=None):
+        return super().get(key, default)
+
+
 # ─── OpenVLA-OFT Adapter ────────────────────────────────────────────────────
 
 class OpenVLAOFTAdapter(OpenVLAAdapter):
-    """Adapter for OpenVLA-OFT — same as OpenVLA but different checkpoint."""
+    """Adapter for OpenVLA-OFT — same as OpenVLA but different checkpoint.
 
-    def __init__(self, hf_id: str = "moojink/openvla-7b-oft-finetuned-bridge"):
+    OFT's forward() always calls _process_action_masks(labels), so we must
+    provide fake labels (all IGNORE_INDEX) even during inference.
+    """
+
+    IGNORE_INDEX = -100
+
+    def __init__(self, hf_id: str = "moojink/openvla-7b-oft-finetuned-libero-spatial"):
         super().__init__(hf_id=hf_id)
 
     def get_config(self) -> ModelConfig:
@@ -355,6 +461,32 @@ class OpenVLAOFTAdapter(OpenVLAAdapter):
         cfg.name = "openvla_oft"
         cfg.hf_id = self.hf_id
         return cfg
+
+    def get_forward_kwargs(self, inputs: dict) -> dict:
+        """OFT needs fake labels for action mask computation."""
+        ids = inputs["input_ids"]
+        labels = torch.full_like(ids, self.IGNORE_INDEX)
+        return {"labels": labels}
+
+    def run_generate(self, model, processor, image, prompt, max_new_tokens=7):
+        """OFT can't use generate() directly — use forward + argmax."""
+        inputs = processor(prompt, image).to(model.device, dtype=torch.bfloat16)
+        extra = self.get_forward_kwargs(inputs)
+        with torch.no_grad():
+            out = model(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs.get("pixel_values"),
+                attention_mask=inputs.get("attention_mask"),
+                **extra,
+            )
+        # Take argmax of last-position logits as "action tokens"
+        logits = out.logits[:, -1, :]
+        action_ids = []
+        for _ in range(max_new_tokens):
+            tok = logits.argmax(dim=-1).item()
+            action_ids.append(tok)
+        decoded = processor.tokenizer.decode(action_ids, skip_special_tokens=True)
+        return action_ids, decoded
 
 
 # ─── Pi0-FAST Adapter ───────────────────────────────────────────────────────
@@ -374,9 +506,9 @@ class Pi0FastAdapter(VLAAdapter):
 
     def load_model(self, device="auto"):
         # pi-0-FAST uses LeRobot API — try direct HF loading first
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+        from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(self.hf_id, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
+        model = _VLAAutoModel.from_pretrained(
             self.hf_id, torch_dtype=torch.bfloat16, device_map=device,
             trust_remote_code=True, attn_implementation="eager",
         )
@@ -436,9 +568,9 @@ class TinyVLAAdapter(VLAAdapter):
         )
 
     def load_model(self, device="auto"):
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+        from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(self.hf_id, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
+        model = _VLAAutoModel.from_pretrained(
             self.hf_id, torch_dtype=torch.bfloat16, device_map=device,
             trust_remote_code=True, attn_implementation="eager",
         )

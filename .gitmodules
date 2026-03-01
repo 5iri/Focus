@@ -16,3 +16,6 @@
 [submodule "3rd_party/CogACT"]
 	path = 3rd_party/CogACT
 	url = https://github.com/microsoft/CogACT.git
+[submodule "3rd_party/openvla"]
+	path = 3rd_party/openvla
+	url = https://github.com/openvla/openvla.git

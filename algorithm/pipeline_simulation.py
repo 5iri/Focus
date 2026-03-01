@@ -325,7 +325,12 @@ def evaluate_accuracy(data, best_cache_rate):
 # ─── Cross-Model Comparison ────────────────────────────────────────────────
 
 def generate_cross_model_comparison(output_dir):
-    """Scan all model results and generate comparison table."""
+    """Scan all model results and generate comparison table.
+
+    Pulls actual wall-clock speedup from output/temporal_results/ when available,
+    falls back to analysis-only data otherwise.
+    """
+    results_dir = os.path.join(os.path.dirname(output_dir), "temporal_results")
     comparison = []
 
     for entry in sorted(os.listdir(output_dir)):
@@ -337,28 +342,50 @@ def generate_cross_model_comparison(output_dir):
         config = data["config"]
         analysis = data["analysis"]
 
-        # Run quick compound reduction estimate
+        # Try to load actual wall-clock results
+        rt_path = os.path.join(results_dir, entry, "results.pt")
+        wall_clock = None
+        if os.path.exists(rt_path):
+            try:
+                rt = torch.load(rt_path, weights_only=False)
+                wall_clock = rt.get("wall_clock")
+            except Exception:
+                pass
+
+        # Cache rate from head types
         best_cache_rate = 0.0
         head_types = analysis["head_types"]
         for htype in ["T", "B"]:
             mask = head_types == htype
             best_cache_rate += mask.sum() / (config["num_layers"] * config["num_heads"])
 
-        best_K = 32  # default
-        compound = compute_compound_reduction(data, best_K, best_cache_rate)
-
-        comparison.append({
+        row = {
             "model_dataset": entry,
             "model": data.get("model", entry.split("_")[0]),
             "dataset": data.get("dataset", "unknown"),
             "num_heads": config["num_heads"],
             "num_layers": config["num_layers"],
-            "speedup": compound["speedup"],
             "cache_rate": best_cache_rate,
             "mean_error": 1.0 - analysis["layer_output_sim"].mean() if len(analysis["layer_output_sim"]) > 0 else 0,
             "head_stability": analysis["head_stability"].mean(),
             "pearson_r": analysis["mean_pearson_r"],
-        })
+        }
+
+        if wall_clock:
+            row["nkf_speedup"] = wall_clock.get("non_kf_speedup", 0)
+            row["amortized_speedup"] = wall_clock.get("amortized_speedup", 0)
+            row["bl_ms"] = wall_clock.get("baseline_median_ms", 0)
+            row["nkf_ms"] = wall_clock.get("non_kf_median_ms", 0)
+        else:
+            # Fallback: theoretical estimate
+            best_K = 32
+            compound = compute_compound_reduction(data, best_K, best_cache_rate)
+            row["nkf_speedup"] = compound["speedup"]
+            row["amortized_speedup"] = 0
+            row["bl_ms"] = 0
+            row["nkf_ms"] = 0
+
+        comparison.append(row)
 
     if not comparison:
         print("No model results found.")
@@ -372,14 +399,17 @@ def generate_cross_model_comparison(output_dir):
         writer.writerows(comparison)
 
     # Print table
-    print(f"\n{'='*90}")
-    print("CROSS-MODEL COMPARISON")
-    print(f"{'='*90}")
-    print(f"{'Model+Dataset':<30} | {'Heads':>5} | {'Layers':>6} | {'Speedup':>8} | {'Error':>8} | {'Cache%':>6} | {'Stab':>5} | {'r':>5}")
-    print("-" * 90)
+    print(f"\n{'='*106}")
+    print("CROSS-MODEL COMPARISON (wall-clock)")
+    print(f"{'='*106}")
+    print(f"{'Model+Dataset':<30} | {'BL ms':>6} | {'NKF ms':>6} | {'NKF spd':>7} | {'Amort':>7} | {'Error':>8} | {'Cache%':>6} | {'Stab':>5} | {'r':>5}")
+    print("-" * 106)
     for row in comparison:
-        print(f"{row['model_dataset']:<30} | {row['num_heads']:>5} | {row['num_layers']:>6} | "
-              f"{row['speedup']:>7.1f}x | {row['mean_error']:>8.5f} | {row['cache_rate']:>5.1%} | "
+        bl_str = f"{row['bl_ms']:.1f}" if row['bl_ms'] > 0 else "  n/a"
+        nkf_str = f"{row['nkf_ms']:.1f}" if row['nkf_ms'] > 0 else "  n/a"
+        amort_str = f"{row['amortized_speedup']:.2f}x" if row['amortized_speedup'] > 0 else "  n/a"
+        print(f"{row['model_dataset']:<30} | {bl_str:>6} | {nkf_str:>6} | "
+              f"{row['nkf_speedup']:>6.2f}x | {amort_str:>7} | {row['mean_error']:>8.5f} | {row['cache_rate']:>5.1%} | "
               f"{row['head_stability']:>5.3f} | {row['pearson_r']:>5.3f}")
 
     print(f"\nSaved to {csv_path}")
