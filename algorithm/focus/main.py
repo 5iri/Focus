@@ -1,5 +1,5 @@
 from typing import List
-import copy
+import tempfile
 
 import torch
 from torch import nn
@@ -518,8 +518,8 @@ class Focus(nn.Module):
 
         self.cur_layer = 0
         if self.export_focus_trace:
-            if not hasattr(self, 'focus_info'):
-                self.focus_info = []
+            if not hasattr(self, '_trace_temp_files'):
+                self._trace_temp_files = []
 
             num_vector = (self.hidden_dim + self.vector_size - 1) // self.vector_size
             num_vector_intermediate = (self.intermediate_dim + self.vector_size - 1) // self.vector_size
@@ -639,21 +639,27 @@ class Focus(nn.Module):
 
         if self.export_focus_trace:
 
-            # append a deep copy of self.info_dict to self.focus_info and clear self.info_dict
-            self.focus_info.append(copy.deepcopy(self.info_dict))
+            # Save trace to a temp file on disk to avoid accumulating GBs in RAM
+            tmp = tempfile.NamedTemporaryFile(
+                dir=self.trace_dir if self.trace_dir and os.path.exists(self.trace_dir) else None,
+                suffix='.pth', delete=False,
+            )
+            torch.save(self.info_dict, tmp.name)
+            tmp.close()
+            self._trace_temp_files.append(tmp.name)
             self.info_dict = {}
 
             if not hasattr(self, "seq_len_info"):
                 self.seq_len_info = []
             self.seq_len_info.append((self.image_token_length, self.num_frames))
 
-            if len(self.focus_info) >= self.limit:
+            if len(self._trace_temp_files) >= self.limit:
 
                 # save the focus_info to a file
                 if self.use_median:
                     if not os.path.exists(self.trace_meta_dir):
                         os.makedirs(self.trace_meta_dir)
-                    median_info_dict = self.focus_info[self.median_sparsity_idx]
+                    median_info_dict = torch.load(self._trace_temp_files[self.median_sparsity_idx], weights_only=False)
                     seq_len = self.seq_len_info[self.median_sparsity_idx][0]
                     num_frames = self.seq_len_info[self.median_sparsity_idx][1]
                     meta_info_dict = {
@@ -669,8 +675,8 @@ class Focus(nn.Module):
                     assert os.path.exists(f'{self.trace_meta_dir}/meta_data.csv'), f"meta info {f'{self.trace_meta_dir}/meta_data.csv'} does not exist"
                     # use index in meta to get the focus_info
                     meta_info_dict = read_from_csv({"Model": self.model_name, "Dataset": self.dataset_name}, f'{self.trace_meta_dir}/meta_data.csv')
-                    index = meta_info_dict["Median index"].values[0]
-                    median_info_dict = self.focus_info[index]
+                    index = int(meta_info_dict["Median index"].values[0])
+                    median_info_dict = torch.load(self._trace_temp_files[index], weights_only=False)
 
                 # make dir if not exists
                 if not os.path.exists(self.trace_dir):
@@ -680,7 +686,13 @@ class Focus(nn.Module):
                 torch.save(median_info_dict, trace_file_name)
                 print(f"Saved focus trace to {trace_file_name}")
 
-                self.focus_info = []
+                # Clean up temp files
+                for tmp_path in self._trace_temp_files:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                self._trace_temp_files = []
                 self.seq_len_info = []
     
     def recover_PE_and_AM(self, position_embeddings, attention_mask):
