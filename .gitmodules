@@ -7,6 +7,12 @@
 [submodule "3rd_party/DRAMsim3"]
 	path = 3rd_party/DRAMsim3
 	url = git@github.com:umd-memsys/DRAMsim3.git
-[submodule "3rd_party/LLaVA-NeXT"]
-	path = 3rd_party/LLaVA-NeXT
-	url = git@github.com:LLaVA-VL/LLaVA-NeXT.git
+[submodule "3rd_party/SimplerEnv-OpenVLA"]
+	path = 3rd_party/SimplerEnv-OpenVLA
+	url = https://github.com/DelinQu/SimplerEnv-OpenVLA.git
+[submodule "3rd_party/lerobot"]
+	path = 3rd_party/lerobot
+	url = https://github.com/huggingface/lerobot.git
+[submodule "3rd_party/CogACT"]
+	path = 3rd_party/CogACT
+	url = https://github.com/microsoft/CogACT.git
